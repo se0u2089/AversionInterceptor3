@@ -7,6 +7,7 @@
 
 /**
  * 
+
  */
 UCLASS()
 class AVERSIONINTERCEPTOR_API AAPlayerCameraManager : public APlayerCameraManager
