@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "AversionInterceptor.h"
 #include "GameFramework/PlayerController.h"
 #include "APlayerController.generated.h"
 

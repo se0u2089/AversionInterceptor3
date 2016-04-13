@@ -1,8 +1,13 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "AversionInterceptor.h"
+#include "AversionInterceptorCharacter.h"
 #include "AversionWeaponInstance.h"
 #include "BulletImpactEffect.h"
+#include "MyPlayerController.h"
+#include "DroneDamageType.h"
+
+
 
 
 
@@ -16,8 +21,40 @@ AAversionWeaponInstance::AAversionWeaponInstance(const class FObjectInitializer&
 	ClientSideHitLeeway = 200.0f;
 	MinimumProjectileSpawnDistance = 800;
 	TracerRoundInterval = 3;
+	LightAttachPoint = TEXT("LightSocket");
+
+	GetWeaponMesh()->AddLocalRotation(FRotator(0, 0, 0));
+
+	LightConeComp = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("LightConeComp"));
+	LightConeComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+	LightConeComp->AttachTo(GetWeaponMesh(), LightAttachPoint, EAttachLocation::SnapToTarget);
+
+	SpotLightComp = CreateDefaultSubobject<USpotLightComponent>(TEXT("SpotLightComp"));
+	SpotLightComp->AttachTo(GetWeaponMesh(), LightAttachPoint, EAttachLocation::SnapToTarget);
+	/*SpotLightComp->SetCastShadows(false);*/
+	SpotLightComp->AddLocalRotation(FRotator(0, -90, -90));
+
+	bIsActive = true;
+	LastEmissiveStrength = -1.0f;
+
+	EmissiveParamName = TEXT("Brightness");
+	MaxEmissiveIntensity = 45.0f;
+
+	/* Doesn't consume "Ammo" */
+	//StartAmmo = 0;
 }
 
+void AAversionWeaponInstance::BeginPlay()
+{
+	Super::BeginPlay();
+
+	/* Create an instance unique to this actor instance to manipulate emissive intensity */
+	USkeletalMeshComponent* MeshComp = GetWeaponMesh();
+	if (MeshComp)
+	{
+		MatDynamic = MeshComp->CreateAndSetMaterialInstanceDynamic(0);
+	}
+}
 
 void AAversionWeaponInstance::FireWeapon()
 {
@@ -71,19 +108,19 @@ void AAversionWeaponInstance::DealDamage(const FHitResult& Impact, const FVector
 	float ActualHitDamage = HitDamage;
 
 	/* Handle special damage location on the zombie body (types are setup in the Physics Asset of the zombie */
-	//USDamageType* DmgType = Cast<USDamageType>(DamageType->GetDefaultObject());
-	//UPhysicalMaterial * PhysMat = Impact.PhysMaterial.Get();
-	//if (PhysMat && DmgType)
-	//{
-	//	if (PhysMat->SurfaceType == SURFACE_ZOMBIEHEAD)
-	//	{
-	//		ActualHitDamage *= DmgType->GetHeadDamageModifier();
-	//	}
-	//	else if (PhysMat->SurfaceType == SURFACE_ZOMBIELIMB)
-	//	{
-	//		ActualHitDamage *= DmgType->GetLimbDamageModifier();
-	//	}
-	//}
+	UDroneDamageType* DmgType = Cast<UDroneDamageType>(DamageType->GetDefaultObject());
+	UPhysicalMaterial * PhysMat = Impact.PhysMaterial.Get();
+	if (PhysMat && DmgType)
+	{
+		if (PhysMat->SurfaceType == SURFACE_ZOMBIEHEAD)
+		{
+			ActualHitDamage *= DmgType->GetHeadDamageModifier();
+		}
+		else if (PhysMat->SurfaceType == SURFACE_ZOMBIELIMB)
+		{
+			ActualHitDamage *= DmgType->GetLimbDamageModifier();
+		}
+	}
 
 	FPointDamageEvent PointDmg;
 	PointDmg.DamageTypeClass = DamageType;
@@ -103,17 +140,17 @@ void AAversionWeaponInstance::ProcessInstantHit(const FHitResult& Impact, const 
 		if (Impact.GetActor() && Impact.GetActor()->GetRemoteRole() == ROLE_Authority)
 		{
 			// Notify the server of our local hit to validate and apply actual hit damage.
-			//ServerNotifyHit(Impact, ShootDir);
+			ServerNotifyHit(Impact, ShootDir);
 		}
 		else if (Impact.GetActor() == nullptr)
 		{
 			if (Impact.bBlockingHit)
 			{
-				//ServerNotifyHit(Impact, ShootDir);
+				ServerNotifyHit(Impact, ShootDir);
 			}
 			else
 			{
-			//	ServerNotifyMiss(ShootDir);
+				ServerNotifyMiss(ShootDir);
 			}
 		}
 	}
@@ -167,6 +204,86 @@ void AAversionWeaponInstance::SimulateInstantHit(const FVector& ImpactPoint)
 }
 
 
+bool AAversionWeaponInstance::ServerNotifyHit_Validate(const FHitResult Impact, FVector_NetQuantizeNormal ShootDir)
+{
+	return true;
+}
+
+
+void AAversionWeaponInstance::ServerNotifyHit_Implementation(const FHitResult Impact, FVector_NetQuantizeNormal ShootDir)
+{
+	// If we have an instigator, calculate the dot between the view and the shot
+	if (Instigator && (Impact.GetActor() || Impact.bBlockingHit))
+	{
+		const FVector Origin = GetMuzzleLocation();
+		const FVector ViewDir = (Impact.Location - Origin).GetSafeNormal();
+
+		const float ViewDotHitDir = FVector::DotProduct(Instigator->GetViewRotation().Vector(), ViewDir);
+		if (ViewDotHitDir > AllowedViewDotHitDir)
+		{
+			// TODO: Check for weapon state
+
+			if (Impact.GetActor() == nullptr)
+			{
+				if (Impact.bBlockingHit)
+				{
+					ProcessInstantHitConfirmed(Impact, Origin, ShootDir);
+				}
+			}
+			// Assume it told the truth about static things because we don't move and the hit
+			// usually doesn't have significant gameplay implications
+			else if (Impact.GetActor()->IsRootComponentStatic() || Impact.GetActor()->IsRootComponentStationary())
+			{
+				ProcessInstantHitConfirmed(Impact, Origin, ShootDir);
+			}
+			else
+			{
+				const FBox HitBox = Impact.GetActor()->GetComponentsBoundingBox();
+
+				FVector BoxExtent = 0.5 * (HitBox.Max - HitBox.Min);
+				BoxExtent *= ClientSideHitLeeway;
+
+				BoxExtent.X = FMath::Max(20.0f, BoxExtent.X);
+				BoxExtent.Y = FMath::Max(20.0f, BoxExtent.Y);
+				BoxExtent.Z = FMath::Max(20.0f, BoxExtent.Z);
+
+				const FVector BoxCenter = (HitBox.Min + HitBox.Max) * 0.5;
+
+				// If we are within client tolerance
+				if (FMath::Abs(Impact.Location.Z - BoxCenter.Z) < BoxExtent.Z &&
+					FMath::Abs(Impact.Location.X - BoxCenter.X) < BoxExtent.X &&
+					FMath::Abs(Impact.Location.Y - BoxCenter.Y) < BoxExtent.Y)
+				{
+					ProcessInstantHitConfirmed(Impact, Origin, ShootDir);
+				}
+			}
+		}
+	}
+
+	// TODO: UE_LOG on failures & rejection
+}
+
+
+bool AAversionWeaponInstance::ServerNotifyMiss_Validate(FVector_NetQuantizeNormal ShootDir)
+{
+	return true;
+}
+
+
+void AAversionWeaponInstance::ServerNotifyMiss_Implementation(FVector_NetQuantizeNormal ShootDir)
+{
+	const FVector Origin = GetMuzzleLocation();
+	const FVector EndTrace = Origin + (ShootDir * WeaponRange);
+
+	// Play on remote clients
+	HitImpactNotify = EndTrace;
+
+	if (GetNetMode() != NM_DedicatedServer)
+	{
+		SpawnTrailEffects(EndTrace);
+	}
+}
+
 
 void AAversionWeaponInstance::SpawnImpactEffects(const FHitResult& Impact)
 {
@@ -210,11 +327,11 @@ void AAversionWeaponInstance::SpawnTrailEffects(const FVector& EndPoint)
 	else
 	{
 		// Only create trails FX by other players.
-	//	AInterceptorCharacter* OwningPawn = GetPawnOwner();
-	//	if (OwningPawn && OwningPawn->IsLocallyControlled())
-	//	{
-	//		return;
-	//	}
+		AAversionInterceptorCharacter* OwningPawn = GetPawnOwner();
+		if (OwningPawn && OwningPawn->IsLocallyControlled())
+		{
+			return;
+		}
 
 		if (TrailFX)
 		{
@@ -231,13 +348,75 @@ void AAversionWeaponInstance::SpawnTrailEffects(const FVector& EndPoint)
 void AAversionWeaponInstance::OnRep_HitLocation()
 {
 	// Played on all remote clients
-	//SimulateInstantHit(HitImpactNotify);
+	SimulateInstantHit(HitImpactNotify);
+}
+
+void AAversionWeaponInstance::OnRep_IsActive()
+{
+	UpdateLight(bIsActive);
+}
+
+void AAversionWeaponInstance::UpdateLight(bool Enabled)
+{
+	/* Turn off light while  */
+	SpotLightComp->SetVisibility(Enabled);
+	LightConeComp->SetVisibility(Enabled);
+
+	/* Update material parameter */
+	if (MatDynamic)
+	{
+		/* " Enabled ? MaxEmissiveIntensity : 0.0f " picks between first or second value based on "Enabled" boolean */
+		MatDynamic->SetScalarParameterValue(EmissiveParamName, Enabled ? MaxEmissiveIntensity : 0.0f);
+	}
 }
 
 
 void AAversionWeaponInstance::GetLifetimeReplicatedProps(TArray< FLifetimeProperty > & OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(AAversionWeaponInstance, bIsActive);
+	DOREPLIFETIME_CONDITION(AAversionWeaponInstance, HitImpactNotify, COND_SkipOwner);
+}
 
-	//DOREPLIFETIME_CONDITION(ASWeaponInstant, HitImpactNotify, COND_SkipOwner);
+
+void AAversionWeaponInstance::OnEnterInventory(AAversionInterceptorCharacter* NewOwner)
+{
+	if (Role == ROLE_Authority)
+	{
+		bIsActive = false;
+
+		/* Turn off light while carried on belt  */
+		UpdateLight(bIsActive);
+	}
+
+	Super::OnEnterInventory(NewOwner);
+}
+
+
+
+void AAversionWeaponInstance::OnEquipFinished()
+{
+	Super::OnEquipFinished();
+
+	if (Role == ROLE_Authority)
+	{
+		bIsActive = true;
+
+		/* Turn off light while carried on belt  */
+		UpdateLight(bIsActive);
+	}
+}
+
+
+void AAversionWeaponInstance::OnUnEquip()
+{
+	Super::OnUnEquip();
+
+	if (Role == ROLE_Authority)
+	{
+		bIsActive = false;
+
+		/* Turn off light while carried on belt  */
+		UpdateLight(bIsActive);
+	}
 }

@@ -7,36 +7,40 @@
 #include "APlayerCameraManager.h"	
 #include "InterceptorCharacter.h"
 #include "AversionWeaponBase.h"
+#include "AversionPlayerState.h"
 
 AAversionInterceptorGameMode::AAversionInterceptorGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 
-static ConstructorHelpers::FClassFinder<APawn> PlayerPawnBPClass(TEXT("/Game/ThirdPersonCPP/Blueprints/ThirdPersonCharacter2"));
-if (PlayerPawnBPClass.Class != NULL)
+	/* Assign the class types used by this gamemode */
+	PlayerControllerClass = AMyPlayerController::StaticClass();
+	PlayerStateClass = AAversionPlayerState::StaticClass();
+	
+	
+
+
+
+}
+
+
+bool AAversionInterceptorGameMode::CanDealDamage(class AAversionPlayerState* DamageInstigator, class AAversionPlayerState* DamagedPlayer) const
 {
+	return true;
+}
 
-	DefaultPawnClass = PlayerPawnBPClass.Class;
 
-	}	
-		PlayerControllerClass = AMyPlayerController::StaticClass();
-	//	for (FConstControllerIterator Iterator = GetWorld()->GetControllerIterator(); Iterator; ++Iterator)
-	//	{
-	//		//SetPlayerDefaults;
-	//		AController* Controller = *Iterator;
-	//		APlayerController* PlayerController = Cast<APlayerController>(Controller);
-	//		if ((PlayerController->GetPawn() == NULL) && PlayerCanRestart(PlayerController))
-	//		{
-	//			RestartPlayer(PlayerController);
-	//		}
-	//	}
-}	
+void AAversionInterceptorGameMode::SetPlayerDefaults(APawn* PlayerPawn)
+{
+//	Super::SetPlayerDefaults(PlayerPawn);
 
+	SpawnDefaultInventory(PlayerPawn);
+}
 
 
 void AAversionInterceptorGameMode::SpawnDefaultInventory(APawn* PlayerPawn)
 {
-	AInterceptorCharacter* MyPawn = Cast<AInterceptorCharacter>(PlayerPawn);
+	AAversionInterceptorCharacter* MyPawn = Cast<AAversionInterceptorCharacter>(PlayerPawn);
 	if (MyPawn)
 	{
 		for (int32 i = 0; i < DefaultInventoryClasses.Num(); i++)
@@ -53,9 +57,29 @@ void AAversionInterceptorGameMode::SpawnDefaultInventory(APawn* PlayerPawn)
 	}
 }
 
-void AAversionInterceptorGameMode::SetPlayerDefaults(APawn* PlayerPawn)
+void AAversionInterceptorGameMode::Killed(AController* Killer, AController* KilledPlayer, APawn* KilledPawn, const UDamageType* DamageType)
 {
-	Super::SetPlayerDefaults(PlayerPawn);
+	AAversionPlayerState* KillerPlayerState = Killer ? Cast<AAversionPlayerState>(Killer->PlayerState) : NULL;
+	AAversionPlayerState* VictimPlayerState = KilledPlayer ? Cast<AAversionPlayerState>(KilledPlayer->PlayerState) : NULL;
 
-	SpawnDefaultInventory(PlayerPawn);
+	if (KillerPlayerState && KillerPlayerState != VictimPlayerState)
+	{
+	//	KillerPlayerState->ScoreKill(VictimPlayerState, KillScore);
+		KillerPlayerState->InformAboutKill(KillerPlayerState, DamageType, VictimPlayerState);
+	}
+
+	if (VictimPlayerState)
+	{
+		//VictimPlayerState->ScoreDeath(KillerPlayerState, DeathScore);
+		VictimPlayerState->BroadcastDeath(KillerPlayerState, DamageType, VictimPlayerState);
+	}
 }
+
+void AAversionInterceptorGameMode::PreInitializeComponents()
+{
+	Super::PreInitializeComponents();
+
+	/* Set timer to run every second */
+//	GetWorldTimerManager().SetTimer(TimerHandle_DefaultTimer, this, &AAversionInterceptorGameMode::DefaultTimer, GetWorldSettings()->GetEffectiveTimeDilation(), true);
+}
+

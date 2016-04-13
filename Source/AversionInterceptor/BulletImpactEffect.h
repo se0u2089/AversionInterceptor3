@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "AversionInterceptor.h"
 #include "GameFramework/Actor.h"
 #include "BulletImpactEffect.generated.h"
 

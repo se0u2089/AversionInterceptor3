@@ -3,6 +3,10 @@
 #include "AversionInterceptor.h"
 #include "AversionInterceptorCharacter.h"
 #include "AversionInterceptorGameMode.h"
+#include "AversionWeaponBase.h"
+#include "SPlayerController.h"
+#include "AversionPlayerState.h"
+#include "DroneDamageType.h"
 
 //////////////////////////////////////////////////////////////////////////
 // AAversionInterceptorCharacter
@@ -20,7 +24,80 @@ AAversionInterceptorCharacter::AAversionInterceptorCharacter(const class FObject
 	/* Don't collide with camera checks to keep 3rd person camera at position when zombies or other players are standing behind us */
 	GetMesh()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+		
+	WeaponAttachPoint = TEXT("WeaponSocket");
+	PelvisAttachPoint = TEXT("PelvisSocket");
+	SpineAttachPoint = TEXT("SpineSocket");
 
+	// Set size for collision capsule
+	GetCapsuleComponent()->InitCapsuleSize(42.f, 96.0f);
+	// Set this character to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
+	PrimaryActorTick.bCanEverTick = true;
+
+
+
+	// Don't rotate when the controller rotates. Let that just affect the camera.
+	bUseControllerRotationPitch = false;
+	bUseControllerRotationYaw = false;
+	bUseControllerRotationRoll = false;
+
+	// Configure character movement
+	GetCharacterMovement()->bOrientRotationToMovement = true; // Character moves in the direction of input...	
+	GetCharacterMovement()->RotationRate = FRotator(0.0f, 540.0f, 0.0f); // ...at this rotation rate
+	GetCharacterMovement()->JumpZVelocity = 600.f;
+	GetCharacterMovement()->AirControl = 0.2f;
+
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	// Adjust jump to make it less floaty
+	MoveComp->GravityScale = 1.5f;
+
+	MoveComp->bCanWalkOffLedgesWhenCrouching = true;
+	MoveComp->MaxWalkSpeedCrouched = 200;
+	MoveComp->bOrientRotationToMovement = true; // Character moves in the direction of input...	
+
+												/* Ignore this channel or it will absorb the trace impacts instead of the skeletal mesh */
+												//GetCapsuleComponent()->SetCollisionResponseToChannel(COLLISION_WEAPON, ECR_Ignore);
+
+												// Enable crouching
+	MoveComp->GetNavAgentPropertiesRef().bCanCrouch = true;
+	CameraBoomComp = ObjectInitializer.CreateDefaultSubobject<USpringArmComponent>(this, TEXT("CameraBoom"));
+	CameraBoomComp->SocketOffset = FVector(0, 35, 0);
+	CameraBoomComp->TargetOffset = FVector(0, 0, 55);
+	CameraBoomComp->bUsePawnControlRotation = true;
+	CameraBoomComp->AttachParent = GetRootComponent();
+
+	CameraComp = ObjectInitializer.CreateDefaultSubobject<UCameraComponent>(this, TEXT("Camera"));
+	CameraComp->AttachParent = CameraBoomComp;
+	// Note: The skeletal mesh and anim blueprint references on the Mesh component (inherited from Character) 
+	TargetingSpeedModifier = 0.5f;
+	SprintingSpeedModifier = 2.5f;
+
+
+
+	Mesh1P = ObjectInitializer.CreateDefaultSubobject<USkeletalMeshComponent>(this, TEXT("PawnMesh1P"));
+	Mesh1P->AttachParent = GetCapsuleComponent();
+	Mesh1P->bOnlyOwnerSee = true;
+	Mesh1P->bOwnerNoSee = false;
+	Mesh1P->bCastDynamicShadow = false;
+	Mesh1P->bReceivesDecals = false;
+	Mesh1P->MeshComponentUpdateFlag = EMeshComponentUpdateFlag::OnlyTickPoseWhenRendered;
+	Mesh1P->PrimaryComponentTick.TickGroup = TG_PrePhysics;
+	Mesh1P->SetCollisionObjectType(ECC_Pawn);
+	Mesh1P->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Mesh1P->SetCollisionResponseToAllChannels(ECR_Ignore);
+
+	GetMesh()->bOnlyOwnerSee = false;
+	GetMesh()->bOwnerNoSee = false;
+	GetMesh()->bReceivesDecals = false;
+	GetMesh()->SetCollisionObjectType(ECC_Pawn);
+	GetMesh()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	GetMesh()->SetCollisionResponseToChannel(COLLISION_WEAPON, ECR_Block);
+	GetMesh()->SetCollisionResponseToChannel(COLLISION_PROJECTILE, ECR_Block);
+	GetMesh()->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+
+
+	GetCapsuleComponent()->SetCollisionResponseToChannel(COLLISION_PROJECTILE, ECR_Block);
+	GetCapsuleComponent()->SetCollisionResponseToChannel(COLLISION_WEAPON, ECR_Ignore);
 }
 
 
@@ -38,12 +115,75 @@ float AAversionInterceptorCharacter::GetMaxHealth() const
 }
 
 
+FName AAversionInterceptorCharacter::GetWeaponAttachPoint() const
+{
+	return WeaponAttachPoint;
+}
+
+void AAversionInterceptorCharacter::SpawnDefaultInventory()
+{
+	if (Role < ROLE_Authority)
+	{
+		return;
+	}
+
+	//
+	int32 NumWeaponClasses = DefaultInventoryClasses.Num();
+	for (int32 i = 0; i < NumWeaponClasses; i++)
+	{
+		if (DefaultInventoryClasses[i])
+		{
+			FActorSpawnParameters SpawnInfo;
+			SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			AAversionWeaponBase* NewWeapon = GetWorld()->SpawnActor<AAversionWeaponBase>(DefaultInventoryClasses[i], SpawnInfo);
+			AddWeapon(NewWeapon);
+	}
+	}
+
+	// equip first weapon in inventory
+	if (Inventory.Num() > 0)
+	{
+		EquipWeapon(Inventory[0]);
+	}
+}
+
 bool AAversionInterceptorCharacter::IsAlive() const
 {
 	return Health > 0;
 }
 
+int32 AAversionInterceptorCharacter::GetInventoryCount() const
+{
+	return Inventory.Num();
+}
 
+AAversionWeaponBase* AAversionInterceptorCharacter::GetInventoryWeapon(int32 index) const
+{
+	return Inventory[index];
+}
+
+bool AAversionInterceptorCharacter::IsEnemyFor(AController* TestPC) const
+{
+	if (TestPC == Controller || TestPC == NULL)
+	{
+		return false;
+	}
+
+	AAversionPlayerState* TestPlayerState = Cast<AAversionPlayerState>(TestPC->PlayerState);
+	AAversionPlayerState* MyPlayerState = Cast<AAversionPlayerState>(PlayerState);
+
+	bool bIsEnemy = true;
+	if (GetWorld()->GameState && GetWorld()->GameState->GameModeClass)
+	{
+		const AAversionInterceptorGameMode* DefGame = GetWorld()->GameState->GameModeClass->GetDefaultObject<AAversionInterceptorGameMode>();
+		if (DefGame)
+		{
+			bIsEnemy = DefGame->CanDealDamage(TestPlayerState, MyPlayerState);
+		}
+	}
+
+	return bIsEnemy;
+}
 
 float AAversionInterceptorCharacter::TakeDamage(float Damage, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, class AActor* DamageCauser)
 {
@@ -124,13 +264,15 @@ bool AAversionInterceptorCharacter::Die(float KillingDamage, FDamageEvent const&
 
 	Health = FMath::Min(0.0f, Health);
 
-	/* Fallback to default DamageType if none is specified */
+	// if this is an environmental death then refer to the previous killer so that they receive credit (knocked into lava pits, etc)
 	UDamageType const* const DamageType = DamageEvent.DamageTypeClass ? DamageEvent.DamageTypeClass->GetDefaultObject<UDamageType>() : GetDefault<UDamageType>();
 	Killer = GetDamageInstigator(Killer, *DamageType);
 
-	/* Notify the gamemode we got killed for scoring and game over state */
-	AController* KilledPlayer = Controller ? Controller : Cast<AController>(GetOwner());
-	//******* fix*****   GetWorld()->GetAuthGameMode<ASGameMode>()->Killed(Killer, KilledPlayer, this, DamageType);
+	AController* const KilledPlayer = (Controller != NULL) ? Controller : Cast<AController>(GetOwner());
+	GetWorld()->GetAuthGameMode<AAversionInterceptorGameMode>()->Killed(Killer, KilledPlayer, this, DamageType);
+
+	NetUpdateFrequency = GetDefault<AAversionInterceptorGameMode>()->NetUpdateFrequency;
+	GetCharacterMovement()->ForceReplicationUpdate();
 
 	OnDeath(KillingDamage, DamageEvent, Killer ? Killer->GetPawn() : NULL, DamageCauser);
 	return true;
@@ -139,6 +281,7 @@ bool AAversionInterceptorCharacter::Die(float KillingDamage, FDamageEvent const&
 
 void AAversionInterceptorCharacter::OnDeath(float KillingDamage, FDamageEvent const& DamageEvent, APawn* PawnInstigator, AActor* DamageCauser)
 {
+
 	if (bIsDying)
 	{
 		return;
@@ -148,84 +291,103 @@ void AAversionInterceptorCharacter::OnDeath(float KillingDamage, FDamageEvent co
 	bTearOff = true;
 	bIsDying = true;
 
-	PlayHit(KillingDamage, DamageEvent, PawnInstigator, DamageCauser, true);
+	if (Role == ROLE_Authority)
+	{
+		ReplicateHit(KillingDamage, DamageEvent, PawnInstigator, DamageCauser, true);
+
+		// play the force feedback effect on the client player controller
+		APlayerController* PC = Cast<APlayerController>(Controller);
+		if (PC && DamageEvent.DamageTypeClass)
+		{
+			UDroneDamageType *DamageType = Cast<UDroneDamageType>(DamageEvent.DamageTypeClass->GetDefaultObject());
+		//	if (DamageType && DamageType->KilledForceFeedback)
+	//		{
+	//			PC->ClientPlayForceFeedback(DamageType->KilledForceFeedback, false, "Damage");
+	//		}
+		}
+	}
+
+	// cannot use IsLocallyControlled here, because even local client's controller may be NULL here
+	if (GetNetMode() != NM_DedicatedServer && DeathSound && Mesh1P && Mesh1P->IsVisible())
+	{
+		UGameplayStatics::PlaySoundAtLocation(this, DeathSound, GetActorLocation());
+	}
+
+	// remove all weapons
+	DestroyInventory();
+
+	// switch back to 3rd person view
+	UpdatePawnMeshes();
 
 	DetachFromControllerPendingDestroy();
+	//StopAllAnimMontages();
 
-	/* Disable all collision on capsule */
-	UCapsuleComponent* CapsuleComp = GetCapsuleComponent();
-	CapsuleComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	CapsuleComp->SetCollisionResponseToAllChannels(ECR_Ignore);
 
-	USkeletalMeshComponent* Mesh3P = GetMesh();
-	if (Mesh3P)
+	if (GetMesh())
 	{
-		Mesh3P->SetCollisionProfileName(TEXT("Ragdoll"));
+		static FName CollisionProfileName(TEXT("Ragdoll"));
+		GetMesh()->SetCollisionProfileName(CollisionProfileName);
 	}
 	SetActorEnableCollision(true);
 
-	SetRagdollPhysics();
+	// Death anim
+	float DeathAnimDuration = PlayAnimMontage(DeathAnim);
 
-	/* Apply physics impulse on the bone of the enemy skeleton mesh we hit (ray-trace damage only) */
-	if (DamageEvent.IsOfType(FPointDamageEvent::ClassID))
+	// Ragdoll
+	if (DeathAnimDuration > 0.f)
 	{
-		FPointDamageEvent PointDmg = *((FPointDamageEvent*)(&DamageEvent));
-		{
-			// TODO: Use DamageTypeClass->DamageImpulse
-			Mesh3P->AddImpulseAtLocation(PointDmg.ShotDirection * 12000, PointDmg.HitInfo.ImpactPoint, PointDmg.HitInfo.BoneName);
-		}
+		// Use a local timer handle as we don't need to store it for later but we don't need to look for something to clear
+		FTimerHandle TimerHandle;
+		GetWorldTimerManager().SetTimer(TimerHandle, this, &AAversionInterceptorCharacter::SetRagdollPhysics, FMath::Min(0.1f, DeathAnimDuration), false);
 	}
-	if (DamageEvent.IsOfType(FRadialDamageEvent::ClassID))
+	else
 	{
-		FRadialDamageEvent RadialDmg = *((FRadialDamageEvent const*)(&DamageEvent));
-		{
-			Mesh3P->AddRadialImpulse(RadialDmg.Origin, RadialDmg.Params.GetMaxRadius(), 100000 /*RadialDmg.DamageTypeClass->DamageImpulse*/, ERadialImpulseFalloff::RIF_Linear);
-		}
+		SetRagdollPhysics();
 	}
+
+	// disable collisions on capsule
+	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	GetCapsuleComponent()->SetCollisionResponseToAllChannels(ECR_Ignore);
 }
 
 
 void AAversionInterceptorCharacter::SetRagdollPhysics()
 {
 	bool bInRagdoll = false;
-	USkeletalMeshComponent* Mesh3P = GetMesh();
 
 	if (IsPendingKill())
 	{
 		bInRagdoll = false;
 	}
-	else if (!Mesh3P || !Mesh3P->GetPhysicsAsset())
+	else if (!GetMesh() || !GetMesh()->GetPhysicsAsset())
 	{
 		bInRagdoll = false;
 	}
 	else
 	{
-		Mesh3P->SetAllBodiesSimulatePhysics(true);
-		Mesh3P->SetSimulatePhysics(true);
-		Mesh3P->WakeAllRigidBodies();
-		Mesh3P->bBlendPhysics = true;
+		// initialize physics/etc
+		GetMesh()->SetAllBodiesSimulatePhysics(true);
+		GetMesh()->SetSimulatePhysics(true);
+		GetMesh()->WakeAllRigidBodies();
+		GetMesh()->bBlendPhysics = true;
 
 		bInRagdoll = true;
 	}
 
-	UCharacterMovementComponent* CharacterComp = Cast<UCharacterMovementComponent>(GetMovementComponent());
-	if (CharacterComp)
-	{
-		CharacterComp->StopMovementImmediately();
-		CharacterComp->DisableMovement();
-		CharacterComp->SetComponentTickEnabled(false);
-	}
+	GetCharacterMovement()->StopMovementImmediately();
+	GetCharacterMovement()->DisableMovement();
+	GetCharacterMovement()->SetComponentTickEnabled(false);
 
 	if (!bInRagdoll)
 	{
-		// Immediately hide the pawn
+		// hide and set short lifespan
 		TurnOff();
 		SetActorHiddenInGame(true);
 		SetLifeSpan(1.0f);
 	}
 	else
 	{
-		SetLifeSpan(10.0f);
+		SetLifeSpan(30.0f);
 	}
 }
 
@@ -289,6 +451,10 @@ void AAversionInterceptorCharacter::OnRep_LastTakeHitInfo()
 	}*/
 }
 
+void AAversionInterceptorCharacter::OnRep_CurrentWeapon(AAversionWeaponBase* LastWeapon)
+{
+	SetCurrentWeapon(CurrentWeapon, LastWeapon);
+}
 
 void AAversionInterceptorCharacter::SetSprinting(bool NewSprinting)
 {
@@ -383,15 +549,550 @@ FRotator AAversionInterceptorCharacter::GetAimOffsets() const
 	return AimRotLS;
 }
 
-void AAversionInterceptorCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bool AAversionInterceptorCharacter::CanFire() const
+{
+	/* Add your own checks here, for example non-shooting areas or checking if player is in an NPC dialogue etc. */
+	return IsAlive();
+}
+
+
+bool AAversionInterceptorCharacter::CanReload() const
+{
+	return IsAlive();
+}
+
+
+bool AAversionInterceptorCharacter::IsFiring() const
+{
+	return CurrentWeapon && CurrentWeapon->GetCurrentState() == EWeaponState::Firing;
+}
+
+
+
+FName AAversionInterceptorCharacter::GetInventoryAttachPoint(EInventorySlot Slot) const
+{
+	/* Return the socket name for the specified storage slot */
+	switch (Slot)
+	{
+	case EInventorySlot::Hands:
+		return WeaponAttachPoint;
+	case EInventorySlot::Primary:
+		return SpineAttachPoint;
+	case EInventorySlot::Secondary:
+		return PelvisAttachPoint;
+	default:
+		// Not implemented.
+		return "";
+	}
+}
+
+
+void AAversionInterceptorCharacter::DestroyInventory()
+{
+	if (Role < ROLE_Authority)
+	{
+		return;
+	}
+
+	for (int32 i = Inventory.Num() - 1; i >= 0; i--)
+	{
+		AAversionWeaponBase* Weapon = Inventory[i];
+		if (Weapon)
+		{
+			RemoveWeapon(Weapon, true);
+		}
+	}
+}
+
+
+void AAversionInterceptorCharacter::SetCurrentWeapon(class AAversionWeaponBase* NewWeapon, class AAversionWeaponBase* LastWeapon)
+{
+	AAversionWeaponBase* LocalLastWeapon = NULL;
+
+	if (LastWeapon != NULL)
+	{
+		LocalLastWeapon = LastWeapon;
+	}
+	else if (NewWeapon != CurrentWeapon)
+	{
+		LocalLastWeapon = CurrentWeapon;
+	}
+
+	// unequip previous
+	if (LocalLastWeapon)
+	{
+		LocalLastWeapon->OnUnEquip();
+	}
+
+	CurrentWeapon = NewWeapon;
+
+	// equip new one
+	if (NewWeapon)
+	{
+		NewWeapon->SetOwningPawn(this);	// Make sure weapon's MyPawn is pointing back to us. During replication, we can't guarantee APawn::CurrentWeapon will rep after AWeapon::MyPawn!
+
+		NewWeapon->OnEquip(LastWeapon);
+	}
+}
+
+
+AAversionWeaponBase* AAversionInterceptorCharacter::GetCurrentWeapon() const
+{
+	return CurrentWeapon;
+}
+
+
+void AAversionInterceptorCharacter::EquipWeapon(AAversionWeaponBase* Weapon)
+{
+	if (Weapon)
+	{
+		/* Ignore if trying to equip already equipped weapon */
+		if (Weapon == CurrentWeapon)
+			return;
+
+		if (Role == ROLE_Authority)
+		{
+			SetCurrentWeapon(Weapon, CurrentWeapon);
+		}
+		else
+		{
+			ServerEquipWeapon(Weapon);
+		}
+	}
+}
+
+
+bool AAversionInterceptorCharacter::ServerEquipWeapon_Validate(AAversionWeaponBase* Weapon)
+{
+	return true;
+}
+
+
+void AAversionInterceptorCharacter::ServerEquipWeapon_Implementation(AAversionWeaponBase* Weapon)
+{
+	EquipWeapon(Weapon);
+}
+
+
+void AAversionInterceptorCharacter::AddWeapon(class AAversionWeaponBase* Weapon)
+{
+	if (Weapon && Role == ROLE_Authority)
+	{
+		Weapon->OnEnterInventory(this);
+		Inventory.AddUnique(Weapon);
+
+		// Equip first weapon in inventory
+		if (Inventory.Num() > 0 && CurrentWeapon == nullptr)
+		{
+			EquipWeapon(Inventory[0]);
+		}
+	}
+}
+
+
+void AAversionInterceptorCharacter::RemoveWeapon(class AAversionWeaponBase* Weapon, bool bDestroy)
+{
+	if (Weapon && Role == ROLE_Authority)
+	{
+		bool bIsCurrent = CurrentWeapon == Weapon;
+
+		if (Inventory.Contains(Weapon))
+		{
+			Weapon->OnLeaveInventory();
+		}
+		Inventory.RemoveSingle(Weapon);
+
+		/* Replace weapon if we removed our current weapon */
+		if (bIsCurrent && Inventory.Num() > 0)
+		{
+			SetCurrentWeapon(Inventory[0]);
+		}
+
+		/* Clear reference to weapon if we have no items left in inventory */
+		if (Inventory.Num() == 0)
+		{
+			SetCurrentWeapon(nullptr);
+		}
+
+		if (bDestroy)
+		{
+			Weapon->Destroy();
+		}
+	}
+}
+
+
+void AAversionInterceptorCharacter::PawnClientRestart()
+{
+	Super::PawnClientRestart();
+	UpdatePawnMeshes();
+	/* Equip the weapon on the client side. */
+	SetCurrentWeapon(CurrentWeapon);
+}
+
+
+void AAversionInterceptorCharacter::OnReload()
+{
+	if (CurrentWeapon)
+	{
+		CurrentWeapon->StartReload();
+	}
+}
+
+
+void AAversionInterceptorCharacter::OnStartFire()
+{
+	if (IsSprinting())
+	{
+		SetSprinting(false);
+	}
+
+	//if (CarriedObjectComp->GetIsCarryingActor())
+	//	{
+	//		StopWeaponFire();
+
+	//		CarriedObjectComp->Throw();
+	//		return;
+	//	}
+
+	StartWeaponFire();
+}
+
+
+void AAversionInterceptorCharacter::OnStopFire()
+{
+	StopWeaponFire();
+}
+
+USkeletalMeshComponent* AAversionInterceptorCharacter::GetPawnMesh() const
+{
+	return IsFirstPerson() ? Mesh1P : GetMesh();
+}
+
+USkeletalMeshComponent* AAversionInterceptorCharacter::GetSpecifcPawnMesh(bool WantFirstPerson) const
+{
+	return WantFirstPerson == true ? Mesh1P : GetMesh();
+
+}
+
+bool AAversionInterceptorCharacter::IsFirstPerson() const
+{
+	return IsAlive() && Controller && Controller->IsLocalPlayerController();
+}
+
+void AAversionInterceptorCharacter::StartWeaponFire()
+{
+	if (!bWantsToFire)
+	{
+		bWantsToFire = true;
+		if (CurrentWeapon)
+		{
+			CurrentWeapon->StartFire();
+		}
+	}
+}
+
+
+void AAversionInterceptorCharacter::StopWeaponFire()
+{
+	if (bWantsToFire)
+	{
+		bWantsToFire = false;
+		if (CurrentWeapon)
+		{
+			CurrentWeapon->StopFire();
+		}
+	}
+}
+
+
+void AAversionInterceptorCharacter::OnNextWeapon()
+{
+	//if (CarriedObjectComp->GetIsCarryingActor())
+	//{
+	//	CarriedObjectComp->Rotate(0.0f, 1.0f);
+	//	return;
+	//}
+
+	if (Inventory.Num() >= 2) // TODO: Check for weaponstate.
+	{
+		const int32 CurrentWeaponIndex = Inventory.IndexOfByKey(CurrentWeapon);
+		AAversionWeaponBase* NextWeapon = Inventory[(CurrentWeaponIndex + 1) % Inventory.Num()];
+		EquipWeapon(NextWeapon);
+	}
+}
+
+
+void AAversionInterceptorCharacter::OnPrevWeapon()
+{
+	//	if (CarriedObjectComp->GetIsCarryingActor())
+	//	{
+	//		CarriedObjectComp->Rotate(0.0f, -1.0f);
+	//		return;
+	//	}
+
+	if (Inventory.Num() >= 2) // TODO: Check for weaponstate.
+	{
+		const int32 CurrentWeaponIndex = Inventory.IndexOfByKey(CurrentWeapon);
+		AAversionWeaponBase* PrevWeapon = Inventory[(CurrentWeaponIndex - 1 + Inventory.Num()) % Inventory.Num()];
+		EquipWeapon(PrevWeapon);
+	}
+}
+
+
+void AAversionInterceptorCharacter::DropWeapon()
+{
+	if (Role < ROLE_Authority)
+	{
+		//ServerDropWeapon();
+		return;
+	}
+
+	if (CurrentWeapon)
+	{
+		FVector CamLoc;
+		FRotator CamRot;
+
+		if (Controller == nullptr)
+		{
+			return;
+		}
+
+		/* Find a location to drop the item, slightly in front of the player.
+		Perform ray trace to check for blocking objects or walls and to make sure we don't drop any item through the level mesh */
+		Controller->GetPlayerViewPoint(CamLoc, CamRot);
+		FVector SpawnLocation;
+		FRotator SpawnRotation = CamRot;
+
+		const FVector Direction = CamRot.Vector();
+		const FVector TraceStart = GetActorLocation();
+		const FVector TraceEnd = GetActorLocation() + (Direction * DropWeaponMaxDistance);
+
+		/* Setup the trace params, we are only interested in finding a valid drop position */
+		FCollisionQueryParams TraceParams;
+		TraceParams.bTraceComplex = false;
+		TraceParams.bReturnPhysicalMaterial = false;
+		TraceParams.AddIgnoredActor(this);
+
+		FHitResult Hit;
+		GetWorld()->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_WorldDynamic, TraceParams);
+
+		/* Find farthest valid spawn location */
+		if (Hit.bBlockingHit)
+		{
+			/* Slightly move away from impacted object */
+			SpawnLocation = Hit.ImpactPoint + (Hit.ImpactNormal * 20);
+		}
+		else
+		{
+			SpawnLocation = TraceEnd;
+		}
+
+		/* Spawn the "dropped" weapon */
+		FActorSpawnParameters SpawnInfo;
+		SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		//	ASWeaponPickup* NewWeaponPickup = GetWorld()->SpawnActor<ASWeaponPickup>(CurrentWeapon->WeaponPickupClass, SpawnLocation, FRotator::ZeroRotator, SpawnInfo);
+
+		//		if (NewWeaponPickup)
+		//		{
+		//			/* Apply torque to make it spin when dropped. */
+		//			UStaticMeshComponent* MeshComp = NewWeaponPickup->GetMeshComponent();
+		//			if (MeshComp)
+		//			{
+		//				MeshComp->SetSimulatePhysics(true);
+		//			MeshComp->AddTorque(FVector(1, 1, 1) * 4000000);
+		//		}
+		//	}
+
+		RemoveWeapon(CurrentWeapon, true);
+	}
+}
+
+
+AAversionWeaponBase * AAversionInterceptorCharacter::GetWeapon() const
+{
+	return CurrentWeapon;
+}
+
+
+void AAversionInterceptorCharacter::PostInitializeComponents()
+{
+	Super::PostInitializeComponents();
+
+	if (Role == ROLE_Authority)
+	{
+		Health = GetMaxHealth();
+		SpawnDefaultInventory();
+	}
+
+	// set initial mesh visibility (3rd person view)
+	UpdatePawnMeshes();
+
+	
+	
+}
+
+bool AAversionInterceptorCharacter::IsFirstPerson()
+{
+	return false;
+}
+
+void AAversionInterceptorCharacter::UpdatePawnMeshes()
+{
+	bool const bFirstPerson = IsFirstPerson();
+
+	Mesh1P->MeshComponentUpdateFlag = !bFirstPerson ? EMeshComponentUpdateFlag::OnlyTickPoseWhenRendered : EMeshComponentUpdateFlag::AlwaysTickPoseAndRefreshBones;
+	Mesh1P->SetOwnerNoSee(!bFirstPerson);
+
+	GetMesh()->MeshComponentUpdateFlag = bFirstPerson ? EMeshComponentUpdateFlag::OnlyTickPoseWhenRendered : EMeshComponentUpdateFlag::AlwaysTickPoseAndRefreshBones;
+GetMesh()->SetOwnerNoSee(bFirstPerson);
+}
+
+
+void AAversionInterceptorCharacter::ServerDropWeapon_Implementation()
+{
+	DropWeapon();
+}
+
+
+
+bool AAversionInterceptorCharacter::ServerDropWeapon_Validate()
+{
+	return true;
+}
+
+
+
+
+
+
+
+ void AAversionInterceptorCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	// Value is already updated locally, skip in replication step
-	//DOREPLIFETIME_CONDITION(ASBaseCharacter, bWantsToRun, COND_SkipOwner);
-	DOREPLIFETIME_CONDITION(AAversionInterceptorCharacter, bIsTargeting, COND_SkipOwner);
+	// only to local owner: weapon change requests are locally instigated, other clients don't need it
+DOREPLIFETIME_CONDITION(AAversionInterceptorCharacter, Inventory, COND_OwnerOnly);
 
-	// Replicate to every client, no special condition required
-	//DOREPLIFETIME(ASBaseCharacter, Health);
-//	DOREPLIFETIME(ASBaseCharacter, LastTakeHitInfo);
+	//everyone except local owner: flag change is locally instigated
+	DOREPLIFETIME_CONDITION(AAversionInterceptorCharacter, bIsTargeting, COND_SkipOwner);
+		DOREPLIFETIME_CONDITION(AAversionInterceptorCharacter, bWantsToRun, COND_SkipOwner);
+
+	//DOREPLIFETIME_CONDITION(AAversionInterceptorCharacter, LastTakeHitInfo, COND_Custom);
+
+	// everyone
+	DOREPLIFETIME(AAversionInterceptorCharacter, CurrentWeapon);
+	DOREPLIFETIME(AAversionInterceptorCharacter, Health);
 }
+
+
+
+
+
+
+
+
+ void AAversionInterceptorCharacter::TurnAtRate(float Rate)
+ {
+	 // calculate delta for this frame from the rate information
+	 AddControllerYawInput(Rate * BaseTurnRate * GetWorld()->GetDeltaSeconds());
+ }
+
+ void AAversionInterceptorCharacter::LookUpAtRate(float Rate)
+ {
+	 // calculate delta for this frame from the rate information
+	 AddControllerPitchInput(Rate * BaseLookUpRate * GetWorld()->GetDeltaSeconds());
+ }
+
+ void AAversionInterceptorCharacter::MoveForward(float Value)
+ {
+	 if ((Controller != NULL) && (Value != 0.0f))
+	 {
+		 // find out which way is forward
+		 const FRotator Rotation = Controller->GetControlRotation();
+		 const FRotator YawRotation(0, Rotation.Yaw, 0);
+
+		 // get forward vector
+		 const FVector Direction = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+		 AddMovementInput(Direction, Value);
+	 }
+ }
+
+ void AAversionInterceptorCharacter::MoveRight(float Value)
+ {
+	 if ((Controller != NULL) && (Value != 0.0f))
+	 {
+		 // find out which way is right
+		 const FRotator Rotation = Controller->GetControlRotation();
+		 const FRotator YawRotation(0, Rotation.Yaw, 0);
+
+		 // get right vector 
+		 const FVector Direction = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+		 // add movement in that direction
+		 AddMovementInput(Direction, Value);
+	 }
+ }
+
+ void AAversionInterceptorCharacter::OnStartTargeting()
+ {
+
+	 bUseControllerRotationPitch = false;
+	 bUseControllerRotationYaw = true;
+	 bUseControllerRotationRoll = false;
+
+	 SetTargeting(true);
+ }
+
+
+ void AAversionInterceptorCharacter::OnEndTargeting()
+ {
+
+	 bUseControllerRotationPitch = false;
+	 bUseControllerRotationYaw = false;
+	 bUseControllerRotationRoll = false;
+
+	 SetTargeting(false);
+ }
+
+
+
+
+ void AAversionInterceptorCharacter::OnCrouchToggle()
+ {
+	 if (IsSprinting())
+	 {
+		 SetSprinting(false);
+	 }
+
+	 // If we are crouching then CanCrouch will return false. If we cannot crouch then calling Crouch() wont do anything
+	 if (CanCrouch())
+	 {
+		 Crouch();
+	 }
+	 else
+	 {
+		 UnCrouch();
+	 }
+ }
+
+
+
+
+ void AAversionInterceptorCharacter::KilledBy(class APawn* EventInstigator)
+ {
+
+ }
